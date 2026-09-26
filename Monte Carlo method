@@ -1,0 +1,226 @@
+"""
+エジプトにおける非正規移民・難民の超過死亡「暗数」推定
+モンテカルロ・シミュレーション + Sobol感度分析
+ 
+構造：
+  暗数 D = N × (基礎死亡率) × (期間) × (全国Pスコア) × (スラム/リスク倍率 R)
+ 
+各パラメータを単一の点ではなく確率分布として与え、10,000回サンプリングして
+Dの分布（95%信頼区間）を得る。さらにSobol感度分析で、どのパラメータの
+不確実性がDの分散に最も寄与しているかを定量化する。
+"""
+ 
+import numpy as np
+from scipy import stats
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
+ 
+# 日本語フォント設定（Noto Sans CJK JPを使用）
+_jp_font_path = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
+try:
+    fm.fontManager.addfont(_jp_font_path)
+    _jp_font_name = fm.FontProperties(fname=_jp_font_path).get_name()
+    plt.rcParams["font.family"] = _jp_font_name
+except Exception:
+    plt.rcParams["font.family"] = "sans-serif"
+plt.rcParams["axes.unicode_minus"] = False
+from SALib.sample import sobol as sobol_sample
+from SALib.analyze import sobol as sobol_analyze
+ 
+rng = np.random.default_rng(42)  # 再現性のためシード固定
+N_SAMPLES = 10_000
+ 
+# ---------------------------------------------------------------------------
+# 1. パラメータ分布の定義
+#    これまでの議論（低位・中位・高位の3点見積もり）を、三角分布(triangular)
+#    の (最小, 最頻値, 最大) に対応させる。三角分布を選ぶ理由：
+#    - 正規分布のように裾が無限に伸びず、非現実的な値域を排除できる
+#    - 一様分布と違い、専門家判断としての「最も尤もらしい値」を反映できる
+#    - フェルミ推定・リスク分析の実務で最も広く使われる分布形状
+# ---------------------------------------------------------------------------
+ 
+PARAMS = {
+    # (a) IOM総移民数からUNHCR登録者を引いた「未登録移民プール」（人）
+    #     870万人を中心に、時点補正の不確実性を±5%程度みる
+    "pool": dict(left=8.0e6, mode=8.7e6, right=8.85e6),
+ 
+    # (b) ID・在留資格を持たず、死亡がCRVSに記録されない層の比率
+    #     ここが最大の不確実性要因（前回議論の核心）
+    "f_unregistered": dict(left=0.05, mode=0.15, right=0.30),
+ 
+    # (c) 出身国構成で加重した平時の粗死亡率 CDR（‰、年率）
+    "cdr_permille": dict(left=5.0, mode=6.4, right=7.05),
+ 
+    # (d) スラム・インフォーマル居住区の環境悪化係数
+    "m_slum": dict(left=1.0, mode=1.3, right=1.6),
+ 
+    # (e) 対象期間（年）2020年3月〜2021年12月 = 22か月で固定（不確実性なし）
+    "period_years": 22 / 12,
+ 
+    # (f) 全国の超過死亡Pスコア（パンデミックによる死亡増加率）
+    "p_score": dict(left=0.20, mode=0.25, right=0.30),
+ 
+    # (g) 非正規移民コミュニティに対するリスク倍率
+    #     レバノン（4倍超）、ムンバイ（感染3.4倍だがIFRは逆）等を根拠にした仮定
+    "risk_multiplier": dict(left=1.0, mode=2.0, right=4.0),
+}
+ 
+ 
+def sample_triangular(spec, size):
+    """(left, mode, right) の三角分布からサンプリング"""
+    return rng.triangular(spec["left"], spec["mode"], spec["right"], size=size)
+ 
+ 
+def run_monte_carlo(n=N_SAMPLES):
+    pool = sample_triangular(PARAMS["pool"], n)
+    f = sample_triangular(PARAMS["f_unregistered"], n)
+    cdr = sample_triangular(PARAMS["cdr_permille"], n) / 1000.0  # ‰ → 比率
+    m_slum = sample_triangular(PARAMS["m_slum"], n)
+    period = PARAMS["period_years"]
+    p_score = sample_triangular(PARAMS["p_score"], n)
+    risk = sample_triangular(PARAMS["risk_multiplier"], n)
+ 
+    N = pool * f  # 未登録・ID無し人口
+    baseline_annual_deaths = N * cdr * m_slum
+    baseline_period_deaths = baseline_annual_deaths * period
+    dark_figure = baseline_period_deaths * p_score * risk
+ 
+    return dict(
+        N=N, cdr=cdr, m_slum=m_slum, p_score=p_score, risk=risk,
+        dark_figure=dark_figure,
+    )
+ 
+ 
+def summarize(dark_figure):
+    ci_low, ci_high = np.percentile(dark_figure, [2.5, 97.5])
+    median = np.median(dark_figure)
+    mean = np.mean(dark_figure)
+    print("=" * 60)
+    print("モンテカルロ・シミュレーション結果（n={:,}）".format(N_SAMPLES))
+    print("=" * 60)
+    print(f"中央値         : {median:>10,.0f} 人")
+    print(f"平均値         : {mean:>10,.0f} 人")
+    print(f"95%信頼区間    : {ci_low:>10,.0f} 〜 {ci_high:,.0f} 人")
+    print(f"5パーセンタイル : {np.percentile(dark_figure, 5):>10,.0f} 人")
+    print(f"95パーセンタイル: {np.percentile(dark_figure, 95):>10,.0f} 人")
+    print("=" * 60)
+    return median, ci_low, ci_high
+ 
+ 
+def plot_histogram(dark_figure, path="/home/claude/histogram.png"):
+    ci_low, ci_high = np.percentile(dark_figure, [2.5, 97.5])
+    median = np.median(dark_figure)
+ 
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    ax.hist(dark_figure, bins=80, color="#4C72B0", alpha=0.75, edgecolor="white")
+    ax.axvline(median, color="#C44E52", linestyle="--", linewidth=2,
+               label=f"中央値 ≈ {median:,.0f} 人")
+    ax.axvline(ci_low, color="#55A868", linestyle=":", linewidth=1.5,
+               label=f"95%CI 下限 ≈ {ci_low:,.0f} 人")
+    ax.axvline(ci_high, color="#55A868", linestyle=":", linewidth=1.5,
+               label=f"95%CI 上限 ≈ {ci_high:,.0f} 人")
+    ax.set_xlabel("推定される暗数（人）")
+    ax.set_ylabel("サンプル数")
+    ax.set_title("非正規移民・難民の超過死亡「暗数」推定分布\n(モンテカルロ n=10,000)")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    print(f"ヒストグラムを保存しました: {path}")
+ 
+ 
+# ---------------------------------------------------------------------------
+# 2. Sobol感度分析
+#    どのパラメータの不確実性が、出力(暗数)の分散に最も寄与しているかを
+#    定量化する。一次効果指数(S1)と全効果指数(ST)を算出する。
+# ---------------------------------------------------------------------------
+ 
+SOBOL_PROBLEM = {
+    "num_vars": 5,
+    "names": ["pool", "f_unregistered", "cdr_permille", "m_slum",
+              "p_score_x_risk"],
+    "bounds": [
+        [PARAMS["pool"]["left"], PARAMS["pool"]["right"]],
+        [PARAMS["f_unregistered"]["left"], PARAMS["f_unregistered"]["right"]],
+        [PARAMS["cdr_permille"]["left"], PARAMS["cdr_permille"]["right"]],
+        [PARAMS["m_slum"]["left"], PARAMS["m_slum"]["right"]],
+        # p_score と risk_multiplier は掛け算でしか登場しないため、
+        # 感度分析では積を1変数として扱う（多重共線性を避けるため）
+        [PARAMS["p_score"]["left"] * PARAMS["risk_multiplier"]["left"],
+         PARAMS["p_score"]["right"] * PARAMS["risk_multiplier"]["right"]],
+    ],
+}
+ 
+ 
+def sobol_model(X):
+    """SALibが要求する形式：X.shape = (n, num_vars) -> Y.shape = (n,)"""
+    pool = X[:, 0]
+    f = X[:, 1]
+    cdr = X[:, 2] / 1000.0
+    m_slum = X[:, 3]
+    p_x_risk = X[:, 4]
+    period = PARAMS["period_years"]
+ 
+    N = pool * f
+    baseline_period_deaths = N * cdr * m_slum * period
+    return baseline_period_deaths * p_x_risk
+ 
+ 
+def run_sobol():
+    # Sobolサンプリングは 2^k のサンプル数を要求する（k: 十分性を保証する定数）
+    param_values = sobol_sample.sample(SOBOL_PROBLEM, 2**10, calc_second_order=True)
+    Y = sobol_model(param_values)
+    Si = sobol_analyze.analyze(SOBOL_PROBLEM, Y, calc_second_order=True,
+                                print_to_console=False)
+    return Si
+ 
+ 
+def plot_tornado(Si, path="/home/claude/tornado.png"):
+    names = SOBOL_PROBLEM["names"]
+    display_names = {
+        "pool": "未登録移民プール(N)",
+        "f_unregistered": "ID無し比率(f)",
+        "cdr_permille": "基礎死亡率(CDR)",
+        "m_slum": "スラム補正係数",
+        "p_score_x_risk": "Pスコア×リスク倍率",
+    }
+    labels = [display_names[n] for n in names]
+    s1 = Si["S1"]
+    st = Si["ST"]
+ 
+    order = np.argsort(st)
+    labels_sorted = [labels[i] for i in order]
+    s1_sorted = np.array(s1)[order]
+    st_sorted = np.array(st)[order]
+ 
+    fig, ax = plt.subplots(figsize=(8, 5))
+    y_pos = np.arange(len(labels_sorted))
+    ax.barh(y_pos, st_sorted, color="#C44E52", alpha=0.6, label="全効果指数 (ST)")
+    ax.barh(y_pos, s1_sorted, color="#4C72B0", alpha=0.9, label="一次効果指数 (S1)")
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(labels_sorted)
+    ax.set_xlabel("Sobol感度指数")
+    ax.set_title("トルネード図：暗数の不確実性に対する各変数の寄与度")
+    ax.legend(loc="lower right")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    print(f"トルネード図を保存しました: {path}")
+ 
+    print("\n" + "=" * 60)
+    print("Sobol感度指数（全効果指数 ST の降順）")
+    print("=" * 60)
+    for i in order[::-1]:
+        print(f"{labels[i]:20s} : S1={s1[i]:.3f}  ST={st[i]:.3f}")
+ 
+ 
+if __name__ == "__main__":
+    print("\n### 1. モンテカルロ・シミュレーション ###\n")
+    results = run_monte_carlo()
+    median, ci_low, ci_high = summarize(results["dark_figure"])
+    plot_histogram(results["dark_figure"])
+ 
+    print("\n### 2. Sobol感度分析 ###\n")
+    Si = run_sobol()
+    plot_tornado(Si)
+ 
